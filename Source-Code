@@ -1,0 +1,151 @@
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+const char* WIFI_SSID  = "Yourssidname";
+const char* WIFI_PASS  = "YourWifiPassword";
+const char* API_KEY    = "Yourapikey";
+const char* serverName = "www.circuitdigest.cloud";
+const char* serverPath = "/api/v1/parking-detection/detect";
+const int   serverPort = 443;
+#define TRIGGER_BTN 13
+unsigned long lastTriggerTime = 0;
+const unsigned long debounceDelay = 500;
+#define PWDN_GPIO_NUM  32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM   0
+#define SIOD_GPIO_NUM  26
+#define SIOC_GPIO_NUM  27
+#define Y9_GPIO_NUM    35
+#define Y8_GPIO_NUM    34
+#define Y7_GPIO_NUM    39
+#define Y6_GPIO_NUM    36
+#define Y5_GPIO_NUM    21
+#define Y4_GPIO_NUM    19
+#define Y3_GPIO_NUM    18
+#define Y2_GPIO_NUM     5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+WiFiClientSecure client;
+void initCamera() {
+  camera_config_t cfg = {};
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM;   cfg.pin_d1 = Y3_GPIO_NUM;
+  cfg.pin_d2 = Y4_GPIO_NUM;   cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM;   cfg.pin_d5 = Y7_GPIO_NUM;
+  cfg.pin_d6 = Y8_GPIO_NUM;   cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;  cfg.pin_pclk  = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM; cfg.pin_href  = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;  cfg.pin_reset = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_VGA;
+  cfg.jpeg_quality = 10;
+  cfg.fb_count     = 1;
+  if (esp_camera_init(&cfg) != ESP_OK) {
+    Serial.println("Camera init failed!");
+    while (1) delay(1000);
+  }
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s, 1);
+  s->set_contrast(s, 1);
+  s->set_saturation(s, 0);
+  s->set_whitebal(s, 1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_gain_ctrl(s, 1);
+  Serial.println("Camera initialized.");
+}
+String sendImageToAPI(camera_fb_t* fb) {
+  if (!client.connect(serverName, serverPort)) {
+    return "Connection failed";
+  }
+  String boundary = "----ESP32Boundary";
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  int contentLen = head.length() + fb->len + tail.length();
+  client.println("POST " + String(serverPath) + " HTTP/1.1");
+  client.println("Host: " + String(serverName));
+  client.println("X-API-Key: " + String(API_KEY));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Content-Length: " + String(contentLen));
+  client.println("Connection: close");
+  client.println();
+  client.print(head);
+  client.write(fb->buf, fb->len);
+  client.print(tail);
+  long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 15000) {
+      client.stop();
+      return "Timeout";
+    }
+  }
+  String response = "";
+  while (client.available()) {
+    response += (char)client.read();
+  }
+  client.stop();
+  int jsonStart = response.indexOf("\r\n\r\n");
+  return (jsonStart != -1) ? response.substring(jsonStart + 4) : response;
+}
+void checkParking() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  esp_camera_fb_return(fb);
+  delay(200);
+  fb = esp_camera_fb_get();
+  if (!fb) { Serial.println("Capture failed"); return; }
+
+  Serial.println("Photo captured! Sending to API...");
+
+  String result = sendImageToAPI(fb);
+  esp_camera_fb_return(fb);
+
+  Serial.println("Response: " + result);
+
+  // Parse occupied and empty counts
+  int occupiedIdx = result.indexOf("\"occupied\":");
+  int emptyIdx    = result.indexOf("\"empty\":");
+  int occupiedCount = 0;
+  int emptyCount    = 0;
+  if (occupiedIdx != -1) {
+    occupiedCount = result.substring(occupiedIdx + 11, occupiedIdx + 13).toInt();
+  }
+  if (emptyIdx != -1) {
+    emptyCount = result.substring(emptyIdx + 8, emptyIdx + 10).toInt();
+  }
+  Serial.println("Occupied slots: " + String(occupiedCount));
+  Serial.println("Empty slots:    " + String(emptyCount));
+  if (emptyCount > 0) {
+    Serial.println("Status: Parking available!");
+  } else {
+    Serial.println("Status: Parking FULL!");
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIGGER_BTN, INPUT_PULLUP);
+  initCamera();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected: " + WiFi.localIP().toString());
+
+  client.setInsecure(); // Accept self-signed certs
+}
+void loop() {
+  if (digitalRead(TRIGGER_BTN) == LOW) {
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastTriggerTime > debounceDelay) {
+      lastTriggerTime = currentTime;
+
+      Serial.println("Button pressed! Capturing image...");
+      checkParking();}}}
