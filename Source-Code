@@ -5,7 +5,7 @@
 
 const char* WIFI_SSID  = "yourssidname";
 const char* WIFI_PASS  = "YourWifipassword";
-const char* API_KEY    = "cd_jre_070126_sw5yR7";
+const char* API_KEY    = "YourApiKey";
 const char* serverName = "www.circuitdigest.cloud";
 const char* serverPath = "/api/v1/parking-detection/detect";
 const int   serverPort = 443;
