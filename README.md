@@ -36,35 +36,18 @@
 
 ## 🌍 Overview
 
-Imagine driving into a crowded parking area and not knowing whether a space is available or not. This project solves that problem by creating a **smart and automated parking space detection system** using the **ESP32-CAM** and **CircuitDigest Cloud**.
+Imagine driving into a crowded parking area and not knowing whether a space is available or not. This project solves that problem by creating a **smart and automated parking space detection system** using the **ESP32-CAM** , **ESP32** and **CircuitDigest Cloud**.
 
-With just a button press, the device:
-1. Captures a real-time image of the parking area
-2. Sends it wirelessly over the internet to the cloud AI
-3. Receives back a breakdown of **occupied vs. free parking spaces**
-4. Displays the result in the Serial Monitor within seconds
+the ultrasonic sensor detects the car near it:
+1. Then the ESP32 which is connected the ultrasonic sensor sends the alert to the esp32 cam to capture the image
+2. The ESP32-Cam capture the image and process the captured image in circuitdigest parking detection API
+3. Then if the esp32-cam gives the parking available message the esp32 triggeres the servo motor to open the gate.
+4. If it gives the response as parking full the gate will be remain closed.
 
 > **Low-cost. Wireless. Real-time. No ML training required.** ⚡
 
 ---
 
-## ⚙️ How It Works
-
-```
-[ Push Button Pressed ]
-        ↓
-[ ESP32-CAM Captures Image of Parking Area ]
-        ↓
-[ Image Sent via Wi-Fi over HTTPS ]
-        ↓
-[ CircuitDigest Cloud API Processes Image with AI ]
-        ↓
-[ Result Returned: Occupied Slots + Free Slots + Confidence Values ]
-        ↓
-[ Output Displayed on Serial Monitor ]
-```
-
-> **Tip:** For testing, a real-time image is not required — any parking lot image from the web works too! Ensure sufficient lighting for better detection accuracy.
 
 ---
 
@@ -73,10 +56,12 @@ With just a button press, the device:
 | S.No | Component | Purpose |
 |------|-----------|---------|
 | 1 | ESP32-CAM | Microcontroller with built-in camera & Wi-Fi |
-| 2 | Push Button | Triggers image capture on press |
+| 2 | ultrasonic sensor | Triggers image capture on object near it |
 | 3 | Breadboard | Simplifies and organizes circuit connections |
 | 4 | USB-to-Serial (FTDI) Adapter *(if needed)* | For programming standard ESP32-CAM without onboard USB |
 | 5 | USB Cable | Powers the system via laptop/PC |
+| 6 | Servo motor | For the gate control |
+| 7 | ESP32 | For controlling the various sensors |
 
 > **⚠️ Note:** If you are using the standard ESP32-CAM (without onboard USB), you need a **USB-to-Serial (FTDI) adapter** for programming:
 > - FTDI **TX** → ESP32-CAM **RX** (U0R)
@@ -86,20 +71,7 @@ With just a button press, the device:
 
 ---
 
-## 🔌 Circuit Diagram
 
-The push button is connected to **GPIO13** of the ESP32-CAM to trigger image capture.
-
-```
-ESP32-CAM            Push Button
----------            -----------
- GPIO13  ───────────  One Terminal
-  GND    ───────────  Other Terminal
-```
-
-> Connect the ESP32-CAM to your laptop via USB for power. Refer to the circuit diagram image in the repository for a detailed visual reference.
-
----
 
 ## 🚀 Getting Started
 
@@ -132,94 +104,6 @@ Go to the [CircuitDigest Cloud website](https://circuitdigest.cloud), create a f
 
 ---
 
-### Step 4: Hardware Setup & Code Upload
-
-1. Connect all components as per the circuit diagram.
-2. Open **Arduino IDE** and install the **ESP32 board package**.
-3. Open the project sketch and fill in your credentials:
-
-```cpp
-const char* WIFI_SSID  = "Your_WiFi_SSID";
-const char* WIFI_PASS  = "Your_WiFi_Password";
-const char* API_KEY    = "Your_API_Key_Here";
-```
-
-4. Select **AI Thinker ESP32-CAM** as the board in Arduino IDE.
-5. Upload the code (hold **GPIO0 LOW** if using FTDI adapter).
-6. Open **Serial Monitor** at **115200 baud**.
-7. Point the camera at a parking area and press the push button.
-8. The parking status result appears on the Serial Monitor within seconds!
-
----
-
-## 💻 Code Explanation
-
-### 1. Library Includes
-
-```cpp
-#include "esp_camera.h"
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-```
-
-Includes libraries for **ESP32 camera control**, **Wi-Fi connectivity**, and **secure HTTPS communication**. The secure client enables encrypted data transfer between the ESP32-CAM and the cloud API.
-
----
-
-### 2. Wi-Fi & API Configuration
-
-```cpp
-const char* WIFI_SSID  = "YourSSID";
-const char* WIFI_PASS  = "YourPassword";
-const char* API_KEY    = "YourAPIKey";
-const char* serverName = "www.circuitdigest.cloud";
-const char* serverPath = "/api/v1/parking-detection/detect";
-```
-
-Defines Wi-Fi credentials and the cloud API server details. The `serverPath` points to the **parking space detection model**. The API key is used for authentication when sending image data to the cloud.
-
----
-
-### 3. Camera Pin Mapping
-
-```cpp
-#define PWDN_GPIO_NUM  32
-#define XCLK_GPIO_NUM   0
-#define Y2_GPIO_NUM     5
-#define PCLK_GPIO_NUM  22
-// ... (remaining pins)
-```
-
-Maps ESP32 GPIO pins to the camera module's data lines, clock, and synchronization signals. A correct pin configuration is essential for stable image capture and system reliability.
-
----
-
-### 4. Camera Initialization
-
-```cpp
-void initCamera() {
-  camera_config_t cfg = {};
-  cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
-  esp_camera_init(&cfg);
-}
-```
-
-Initializes the camera in **JPEG format** at **VGA resolution** for an optimal balance of transmission speed and image quality. If initialization fails, the system halts to prevent further errors.
-
----
-
-### 5. Capture & Send to API
-
-```cpp
-camera_fb_t* fb = esp_camera_fb_get();   // Capture image
-String result = sendImageToAPI(fb);       // Send to cloud API
-esp_camera_fb_return(fb);                 // Free frame buffer
-```
-
-On button press, captures a JPEG image and sends it to the CircuitDigest Cloud API via **HTTPS POST**. The frame buffer is released after transmission to free memory. The API processes the image using its AI model and returns the parking detection result.
-
----
 
 ## 📊 Output
 
@@ -228,7 +112,7 @@ After pressing the push button, the Serial Monitor displays:
 ```
 Connecting to WiFi...
 WiFi Connected!
-Button Pressed - Capturing Image...
+car detected - Capturing Image...
 Image Captured. Sending to API...
 
 --- Parking Space Detection Result ---
@@ -236,7 +120,8 @@ Total Spaces Detected: 10
   Occupied Slots : 7  (Confidence: 96.3%)
   Empty Slots    : 3  (Confidence: 94.1%)
 
-Parking Status: LIMITED SPACES AVAILABLE
+Parking Status: availble
+Gate open
 ```
 
 > The result includes **occupied count**, **empty count**, and the **confidence score** for each category.
@@ -294,16 +179,13 @@ Parking Status: LIMITED SPACES AVAILABLE
 **2. Why is the cloud API used instead of local processing?**
 > The ESP32-CAM has limited memory and processing power, which makes running complex AI models locally impractical. The cloud API performs heavy inference on powerful servers, ensuring better accuracy and real-time performance.
 
-**3. What happens when the push button is pressed?**
-> The ESP32-CAM captures an image of the parking area and sends it to the CircuitDigest Cloud API. The API processes the image and returns the number of **occupied** and **empty** parking slots, which are then displayed on the Serial Monitor.
-
-**4. How accurate is the parking detection system?**
+**3. How accurate is the parking detection system?**
 > Accuracy depends on image quality, lighting conditions, and camera positioning. Clear images with good lighting and fully visible parking slots significantly improve detection accuracy.
 
-**5. Can this system work without the internet?**
+**4. Can this system work without the internet?**
 > No. The system requires an active internet connection because all image processing is performed on the cloud server. Without internet, the ESP32-CAM cannot send data to the API.
 
-**6. What are the limitations of this system?**
+**5. What are the limitations of this system?**
 > The system depends on internet connectivity and API usage limits. It may also produce incorrect results if image quality is poor or parking slots are not clearly visible in the captured image.
 
 ---
