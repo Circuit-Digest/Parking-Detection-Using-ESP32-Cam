@@ -1,0 +1,352 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#if __has_include(<NetworkClientSecure.h>)
+  #include <NetworkClientSecure.h>
+  using SecureClient = NetworkClientSecure;
+#else
+  #include <WiFiClientSecure.h>
+  using SecureClient = WiFiClientSecure;
+#endif
+#include <WebServer.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+// ── Config ────────────────────────────────────────────────────────
+const char* WIFI_SSID  = "Yourssidname";
+const char* WIFI_PASS  = "yourwifipassword";
+const char* API_KEY    = "yourapikey";
+const char* serverName = "www.circuitdigest.cloud";
+const char* serverPath = "/api/v1/parking-detection/detect";
+const int   serverPort = 443;
+
+// ── Camera Pins ───────────────────────────────────────────────────
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
+
+// ── Globals ───────────────────────────────────────────────────────
+WebServer server(80);
+SemaphoreHandle_t camMutex    = NULL;
+SemaphoreHandle_t resultMutex = NULL;
+
+static int  g_occupied = -1;
+static int  g_empty    = -1;
+static char g_result[16] = "IDLE";
+
+static volatile bool g_triggerDetection = false;
+
+// ── Helpers ───────────────────────────────────────────────────────
+inline bool lockCam(TickType_t wait = portMAX_DELAY) {
+  return xSemaphoreTake(camMutex, wait) == pdTRUE;
+}
+inline void unlockCam() { xSemaphoreGive(camMutex); }
+
+void setResult(const char* r) {
+  xSemaphoreTake(resultMutex, portMAX_DELAY);
+  strncpy(g_result, r, sizeof(g_result) - 1);
+  xSemaphoreGive(resultMutex);
+}
+String getResult() {
+  xSemaphoreTake(resultMutex, portMAX_DELAY);
+  String r = String(g_result);
+  xSemaphoreGive(resultMutex);
+  return r;
+}
+
+// ── Camera init ───────────────────────────────────────────────────
+void initCamera() {
+  camera_config_t cfg = {};
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM;
+  cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM;
+  cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM;    cfg.pin_pclk=PCLK_GPIO_NUM;
+  cfg.pin_vsync=VSYNC_GPIO_NUM;  cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM;
+  cfg.pin_pwdn=PWDN_GPIO_NUM;    cfg.pin_reset=RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_SVGA;
+  cfg.jpeg_quality = 8;
+  cfg.fb_count     = 2;
+  if (esp_camera_init(&cfg) != ESP_OK) {
+    Serial.println("[CAM] FAILED"); while (true) delay(1000);
+  }
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s,1); s->set_contrast(s,1);
+  s->set_saturation(s,0); s->set_whitebal(s,1);
+  s->set_exposure_ctrl(s,1); s->set_gain_ctrl(s,1);
+  s->set_aec2(s,1); s->set_ae_level(s,1);
+  Serial.println("[CAM] ready");
+}
+
+// ── JSON parser ───────────────────────────────────────────────────
+int parseJsonInt(const String& json, const String& key) {
+  int idx = json.indexOf("\"" + key + "\":");
+  if (idx == -1) return -1;
+  int s = idx + key.length() + 3;
+  while (s < (int)json.length() && !isDigit(json[s])) s++;
+  int e = s;
+  while (e < (int)json.length() && isDigit(json[e])) e++;
+  return (e == s) ? -1 : json.substring(s, e).toInt();
+}
+
+// ── Detection logic ───────────────────────────────────────────────
+void doDetection() {
+  setResult("PENDING");
+  Serial.println("[DET] Capturing frame...");
+
+  if (!lockCam(pdMS_TO_TICKS(5000))) {
+    Serial.println("[DET] Camera lock timeout"); setResult("ERROR"); return;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_VGA);
+  s->set_quality(s, 10);
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  camera_fb_t* wf = esp_camera_fb_get();
+  if (wf) esp_camera_fb_return(wf);           // discard stale frame
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  s->set_framesize(s, FRAMESIZE_SVGA);
+  s->set_quality(s, 8);
+
+  if (!fb) {
+    Serial.println("[DET] Frame capture failed");
+    unlockCam(); setResult("ERROR"); return;
+  }
+  Serial.printf("[DET] Frame: %u bytes\n", (unsigned)fb->len);
+
+  size_t   imgLen = fb->len;
+  uint8_t* imgBuf = psramFound() ? (uint8_t*)ps_malloc(imgLen) : (uint8_t*)malloc(imgLen);
+  if (!imgBuf) {
+    Serial.println("[DET] malloc failed");
+    esp_camera_fb_return(fb); unlockCam(); setResult("ERROR"); return;
+  }
+  memcpy(imgBuf, fb->buf, imgLen);
+  esp_camera_fb_return(fb);
+  unlockCam();   // camera free — stream resumes
+
+  // ── Upload ────────────────────────────────────────────────────
+  Serial.println("[DET] Uploading to API...");
+  SecureClient client;
+  client.setInsecure();
+  client.setTimeout(20);
+
+  if (!client.connect(serverName, serverPort)) {
+    Serial.println("[DET] API connect failed");
+    free(imgBuf); setResult("ERROR"); return;
+  }
+
+  String bnd  = "----ESP32Bnd";
+  String head = "--" + bnd + "\r\nContent-Disposition: form-data; "
+                "name=\"imageFile\"; filename=\"snap.jpg\"\r\n"
+                "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + bnd + "--\r\n";
+  int    cLen = head.length() + (int)imgLen + tail.length();
+
+  client.println("POST " + String(serverPath) + " HTTP/1.1");
+  client.println("Host: " + String(serverName));
+  client.println("X-API-Key: " + String(API_KEY));
+  client.println("Content-Type: multipart/form-data; boundary=" + bnd);
+  client.println("Content-Length: " + String(cLen));
+  client.println("Connection: close");
+  client.println();
+  client.print(head);
+
+  size_t sent = 0;
+  while (sent < imgLen) {
+    size_t n = min((size_t)1024, imgLen - sent);
+    client.write(imgBuf + sent, n);
+    sent += n;
+    taskYIELD();
+  }
+  client.print(tail);
+  free(imgBuf);
+
+  // ── Read response ─────────────────────────────────────────────
+  uint32_t t = millis();
+  while (!client.available()) {
+    if (millis() - t > 18000) {
+      client.stop(); setResult("ERROR");
+      Serial.println("[DET] Response timeout"); return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  String resp = "";
+  t = millis();
+  while (client.available() || millis() - t < 2000) {
+    if (client.available()) { resp += (char)client.read(); t = millis(); }
+    taskYIELD();
+  }
+  client.stop();
+
+  int js = resp.indexOf("\r\n\r\n");
+  String json = (js != -1) ? resp.substring(js + 4) : resp;
+  json.trim();
+  int br = json.indexOf('{');
+  if (br > 0) json = json.substring(br);
+  Serial.println("[DET] JSON: " + json);
+
+  int occ = parseJsonInt(json, "occupied");
+  int emp = parseJsonInt(json, "empty");
+
+  if (occ < 0 || emp < 0) {
+    Serial.println("[DET] Parse failed"); setResult("ERROR"); return;
+  }
+
+  xSemaphoreTake(resultMutex, portMAX_DELAY);
+  g_occupied = occ; g_empty = emp;
+  strncpy(g_result, emp > 0 ? "AVAILABLE" : "FULL", sizeof(g_result)-1);
+  xSemaphoreGive(resultMutex);
+
+  Serial.printf("[DET] Occupied:%d Empty:%d → %s\n", occ, emp, g_result);
+}
+
+// ── Detection task — Core 0, LOWEST priority ─────────────────────
+// Spends 99% of time in vTaskDelay so web server is never starved
+void detectionTask(void* /*arg*/) {
+  Serial.println("[DET] task ready");
+  for (;;) {
+    if (g_triggerDetection) {
+      g_triggerDetection = false;
+      doDetection();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ── Web Handlers ──────────────────────────────────────────────────
+void handleCapture() {
+  Serial.println("[WEB] /capture");
+  if (getResult() != "PENDING") {
+    g_triggerDetection = true;
+    setResult("PENDING");
+  }
+  server.send(200, "text/plain", "PENDING");
+}
+
+void handleResult() {
+  String r = getResult();
+  server.send(200, "text/plain", r);
+  Serial.println("[WEB] /result → " + r);
+}
+
+void handleRoot() {
+  String res   = getResult();
+  String occ   = (g_occupied >= 0) ? String(g_occupied) : "--";
+  String emp   = (g_empty    >= 0) ? String(g_empty)    : "--";
+  String color = res=="AVAILABLE" ? "#00ff88"
+               : res=="PENDING"   ? "#facc15"
+               : res=="FULL"      ? "#ff4444" : "#888";
+
+  String html =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta http-equiv='refresh' content='3'>"
+    "<title>Parking</title>"
+    "<style>body{background:#111;color:#ccc;font-family:monospace;padding:16px;margin:0}"
+    "h2{color:#0cf;margin:0 0 12px}"
+    ".card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:14px;margin-bottom:10px}"
+    ".lbl{font-size:.7em;color:#555;text-transform:uppercase;letter-spacing:1px}"
+    ".big{font-size:1.6em;font-weight:bold}"
+    ".grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}"
+    "img{width:100%;border-radius:6px;border:1px solid #333}"
+    ".foot{font-size:.7em;color:#444;margin-top:8px;text-align:center}</style></head><body>"
+    "<h2>&#x1F697; Parking</h2>"
+    "<div class='card'><div class='lbl'>Status</div>"
+      "<div class='big' style='color:" + color + "'>" + res + "</div></div>"
+    "<div class='grid'>"
+      "<div class='card'><div class='lbl'>Occupied</div><div class='big' style='color:#f80'>" + occ + "</div></div>"
+      "<div class='card'><div class='lbl'>Empty</div><div class='big' style='color:#0f8'>" + emp + "</div></div>"
+    "</div>"
+    "<div class='card'><div class='lbl'>Live Stream</div><br>"
+      "<img src='/stream' onerror=\"setTimeout(()=>this.src='/stream?t='+Date.now(),2000)\"></div>"
+    "<p class='foot'>Auto-refresh 3s &nbsp;|&nbsp; " + WiFi.localIP().toString() + "</p>"
+    "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleStream() {
+  WiFiClient sc = server.client();
+  sc.print("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+           "Cache-Control: no-cache\r\nConnection: close\r\n\r\n");
+  uint32_t last = millis();
+  while (sc.connected()) {
+    if (millis() - last > 8000) break;
+    if (!lockCam(pdMS_TO_TICKS(200))) { vTaskDelay(pdMS_TO_TICKS(80)); continue; }
+    camera_fb_t* d = esp_camera_fb_get(); if (d) esp_camera_fb_return(d);
+    camera_fb_t* fb = esp_camera_fb_get();
+    unlockCam();
+    if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+    sc.print("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+    sc.print(fb->len); sc.print("\r\n\r\n");
+    size_t w = sc.write(fb->buf, fb->len);
+    sc.print("\r\n");
+    esp_camera_fb_return(fb);
+    if (!w) break;
+    last = millis();
+    vTaskDelay(pdMS_TO_TICKS(60));
+  }
+  sc.stop();
+}
+
+
+
+// ── Setup ─────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== ESP32-CAM Parking Server v3 ===");
+
+  camMutex    = xSemaphoreCreateMutex();
+  resultMutex = xSemaphoreCreateMutex();
+
+  initCamera();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WiFi] connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[WEB]  http://%s/\n",        WiFi.localIP().toString().c_str());
+  Serial.printf("[CAP]  http://%s/capture\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[RES]  http://%s/result\n",  WiFi.localIP().toString().c_str());
+
+  server.on("/",        handleRoot);
+  server.on("/stream",  HTTP_GET, handleStream);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/result",  HTTP_GET, handleResult);
+  server.begin();
+
+  // Web task: Core 0, priority 10 — always wins over detection
+  // Detection task: Core 0, priority 1 — only runs when web task is idle
+  xTaskCreatePinnedToCore(detectionTask, "detTask", 12288, NULL,  1, NULL, 0);
+
+  Serial.println("[READY]");
+}
+
+void loop() {
+  server.handleClient();
+  delay(2);
+}
