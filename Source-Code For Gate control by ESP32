@@ -1,0 +1,156 @@
+/*
+ * ESP32 Gate Controller v3
+ * ─────────────────────────────────────────────────────────────────
+ * Wiring:
+ *   HC-SR04 TRIG → GPIO 25
+ *   HC-SR04 ECHO → GPIO 26
+ *   Servo        → GPIO 27
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESP32Servo.h>
+
+const char* WIFI_SSID = "Yourssidname";
+const char* WIFI_PASS = "yourwifipassword";
+const char* CAM_IP    = "192.168.29.178";  // ← ESP32-CAM IP which will be provided when the esp32 cams code is uploaded. you find this ip in the esp32cam's serial monitor after uploading the code. 
+
+#define DETECT_CM    30
+#define GATE_OPEN_MS 5000
+#define COOLDOWN_MS  12000UL
+
+#define TRIG_PIN  25
+#define ECHO_PIN  26
+#define SERVO_PIN 27
+
+Servo gateServo;
+unsigned long lastTrigger = 0;
+
+void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("[WiFi] reconnecting");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " FAILED");
+}
+
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long d = pulseIn(ECHO_PIN, HIGH, 25000);
+  return d == 0 ? 999.0f : (d * 0.034f) / 2.0f;
+}
+
+void openGate() {
+  Serial.println("[GATE] Opening");
+  gateServo.write(90);
+  delay(GATE_OPEN_MS);
+  gateServo.write(0);
+  Serial.println("[GATE] Closed");
+}
+
+// ── Trigger camera, poll /result until answer or timeout ─────────
+void triggerCamera() {
+  ensureWiFi();
+
+  // Step 1: POST /capture with retries (3 attempts, 2s gap)
+  bool triggered = false;
+  for (int attempt = 1; attempt <= 3 && !triggered; attempt++) {
+    Serial.printf("[HTTP] /capture attempt %d...\n", attempt);
+    HTTPClient http;
+    http.begin("http://" + String(CAM_IP) + "/capture");
+    http.setTimeout(10000);   // 10 s — enough for TCP accept + handler
+    int code = http.GET();
+    http.end();
+
+    if (code == 200) {
+      Serial.println("[HTTP] /capture OK — detection started");
+      triggered = true;
+    } else {
+      Serial.printf("[HTTP] /capture code %d — retrying in 2s\n", code);
+      delay(2000);
+    }
+  }
+
+  if (!triggered) {
+    Serial.println("[HTTP] All /capture attempts failed — gate stays closed");
+    return;
+  }
+
+  // Step 2: Poll /result every 2 s, up to 35 s
+  String result = "PENDING";
+  uint32_t deadline = millis() + 35000;
+
+  while (millis() < deadline) {
+    delay(2000);
+    HTTPClient http;
+    http.begin("http://" + String(CAM_IP) + "/result");
+    http.setTimeout(5000);
+    int code = http.GET();
+    if (code == 200) {
+      result = http.getString();
+      result.trim();
+      Serial.println("[HTTP] /result → " + result);
+    } else {
+      Serial.printf("[HTTP] /result code %d\n", code);
+    }
+    http.end();
+    if (result != "PENDING") break;
+  }
+
+  // Step 3: Act
+  if (result == "AVAILABLE") {
+    Serial.println("[GATE] AVAILABLE — opening");
+    openGate();
+  } else if (result == "FULL") {
+    Serial.println("[GATE] FULL — staying closed");
+  } else if (result == "PENDING") {
+    Serial.println("[GATE] Timed out waiting for result");
+  } else {
+    Serial.println("[GATE] Result: " + result);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== ESP32 Gate Controller v3 ===");
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(0);
+  Serial.println("[SERVO] Closed (0°)");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WiFi] connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[READY] Watching for cars within %d cm\n", DETECT_CM);
+}
+
+void loop() {
+  float dist = getDistance();
+
+  static float lastPrinted = -1;
+  if (fabs(dist - lastPrinted) > 2.0f && dist < 200.0f) {
+    Serial.printf("[US] %.1f cm\n", dist);
+    lastPrinted = dist;
+  }
+
+  if (dist < (float)DETECT_CM && millis() - lastTrigger > COOLDOWN_MS) {
+    lastTrigger = millis();
+    Serial.printf("\n[TRIGGER] Car at %.1f cm\n", dist);
+    triggerCamera();
+    Serial.printf("[COOLDOWN] %lu s\n", COOLDOWN_MS / 1000);
+  }
+
+  delay(200);
+}
